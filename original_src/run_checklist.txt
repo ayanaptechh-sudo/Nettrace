@@ -1,0 +1,15 @@
+# 1. From inside NetTrace/
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+# 2. Install deps
+pip install -r requirements.txt
+# 3. Sanity check
+python config.py            # prints paths + "Configuration OK ✅"
+# 4. Run tests
+python -m unittest discover -s tests -v
+# 5. Launch dashboard (needs admin/root for capture)
+sudo python main.py         # Linux/macOS
+# or Windows: Run PowerShell as Administrator → python main.py
+AFTER PROJECT SETUP OUTPUT

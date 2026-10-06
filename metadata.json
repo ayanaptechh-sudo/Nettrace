@@ -1,0 +1,8 @@
+{
+  "name": "NetTrace - Network Security Monitoring & Anomaly Detector",
+  "description": "Production-grade cybersecurity traffic monitor and anomaly detector. Captures network traffic metadata, builds statistical baselines, detects unknown and suspicious behaviors, and exports comprehensive HTML and PDF security reports.",
+  "prompt": "NetTrace Unknown Network Traffic Detector",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

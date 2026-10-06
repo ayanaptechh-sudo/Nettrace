@@ -1,0 +1,2659 @@
+Problem Statement 
+NetTrace is a Python-based desktop cybersecurity application designed to monitor network traffic metadata and identify unknown or suspicious network activity. The project captures basic traffic information without storing packet payloads, analyzes traffic using statistical baselines, detects unusual or risky activity, stores monitoring data in SQLite, and displays security information through a Flet-based dashboard. The system also generates professional HTML and PDF security reports, providing users with a simple way to monitor, analyze, and review network activity for educational and authorized cybersecurity monitoring purposes.
+Folder Structure
+models.py
+"""
+NetTrace — Data Models
+======================
+Typed dataclasses for packets, alerts, and baseline entries.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any
+@dataclass(slots=True)
+class PacketRecord:
+    """A single captured packet metadata record."""
+    timestamp: str
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    protocol: str
+    length: int
+    classification: str
+    reason: str = ""
+    id: int | None = None
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain dict representation."""
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp,
+            "src_ip": self.src_ip,
+            "dst_ip": self.dst_ip,
+            "src_port": self.src_port,
+            "dst_port": self.dst_port,
+            "protocol": self.protocol,
+            "length": self.length,
+            "classification": self.classification,
+            "reason": self.reason,
+        }
+@dataclass(slots=True)
+class AlertRecord:
+    """A security alert derived from a packet classification."""
+    timestamp: str
+    severity: str
+    src_ip: str
+    dst_ip: str
+    dst_port: int
+    protocol: str
+    message: str
+    id: int | None = None
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain dict representation."""
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp,
+            "severity": self.severity,
+            "src_ip": self.src_ip,
+            "dst_ip": self.dst_ip,
+            "dst_port": self.dst_port,
+            "protocol": self.protocol,
+            "message": self.message,
+        }
+@dataclass(slots=True)
+class BaselineEntry:
+    """Statistical baseline for a (dst_port, protocol) pair."""
+    dst_port: int
+    protocol: str
+    hit_count: int = 0
+    total_bytes: int = 0
+    byte_history: list[int] = field(default_factory=list)
+    rate_window: list[float] = field(default_factory=list)
+    first_seen: str = ""
+    last_seen: str = ""
+    id: int | None = None
+    def mean_bytes(self) -> float:
+        """Mean of byte_history, or 0.0 if empty."""
+        if not self.byte_history:
+            return 0.0
+        return sum(self.byte_history) / len(self.byte_history)
+    def stddev_bytes(self) -> float:
+        """Population stddev of byte_history, or 0.0 if <2 samples."""
+        n = len(self.byte_history)
+        if n < 2:
+            return 0.0
+        mean = self.mean_bytes()
+        variance = sum((x - mean) ** 2 for x in self.byte_history) / n
+        return variance ** 0.5
+database.py
+"""
+NetTrace — SQLite Storage Layer
+===============================
+Schema init, packet/alert insertion, baseline upsert, and queries.
+"""
+from __future__ import annotations
+import json
+import sqlite3
+from contextlib import contextmanager
+from typing import Iterator
+from config import DB_PATH, MAX_BYTE_HISTORY, MAX_RATE_SAMPLES
+from models import AlertRecord, BaselineEntry, PacketRecord
+from utils import now_timestamp
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """Yield a SQLite connection with row factory and safe close."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+def init_db() -> None:
+    """Create tables and indexes if they do not exist."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS packets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT NOT NULL,
+                src_port INTEGER NOT NULL,
+                dst_port INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                length INTEGER NOT NULL,
+                classification TEXT NOT NULL,
+                reason TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_packets_ts ON packets(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_packets_class ON packets(classification);
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT NOT NULL,
+                dst_port INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_alerts_sev ON alerts(severity);
+            CREATE TABLE IF NOT EXISTS baseline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dst_port INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER NOT NULL DEFAULT 0,
+                byte_history_json TEXT NOT NULL DEFAULT '[]',
+                rate_window_json TEXT NOT NULL DEFAULT '[]',
+                first_seen TEXT NOT NULL DEFAULT '',
+                last_seen TEXT NOT NULL DEFAULT '',
+                UNIQUE(dst_port, protocol)
+            );
+            """
+        )
+# ─── Packets ─────────────────────────────────────────────────────
+def insert_packet(p: PacketRecord) -> int:
+    """Insert a packet record and return its row id."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO packets
+              (timestamp, src_ip, dst_ip, src_port, dst_port,
+               protocol, length, classification, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                p.timestamp, p.src_ip, p.dst_ip, p.src_port, p.dst_port,
+                p.protocol, p.length, p.classification, p.reason,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+def get_recent_packets(limit: int = 100) -> list[PacketRecord]:
+    """Return the most recent packets ordered by time desc."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM packets ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [
+        PacketRecord(
+            id=r["id"], timestamp=r["timestamp"], src_ip=r["src_ip"],
+            dst_ip=r["dst_ip"], src_port=r["src_port"], dst_port=r["dst_port"],
+            protocol=r["protocol"], length=r["length"],
+            classification=r["classification"], reason=r["reason"] or "",
+        )
+        for r in rows
+    ]
+def get_packet_stats() -> tuple[int, int, int]:
+    """Return (total, unknown, suspicious) packet counts."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+        unknown = conn.execute(
+            "SELECT COUNT(*) FROM packets WHERE classification='UNKNOWN'"
+        ).fetchone()[0]
+        suspicious = conn.execute(
+            "SELECT COUNT(*) FROM packets WHERE classification='SUSPICIOUS'"
+        ).fetchone()[0]
+    return int(total), int(unknown), int(suspicious)
+def get_protocol_stats() -> list[tuple[str, int]]:
+    """Return protocol counts as (protocol, count) tuples."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT protocol, COUNT(*) AS c FROM packets GROUP BY protocol ORDER BY c DESC"
+        ).fetchall()
+    return [(r["protocol"], int(r["c"])) for r in rows]
+def get_top_unknown_sources(limit: int = 20) -> list[tuple[str, int]]:
+    """Return top source IPs with UNKNOWN/SUSPICIOUS traffic."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT src_ip, COUNT(*) AS c FROM packets
+            WHERE classification IN ('UNKNOWN','SUSPICIOUS')
+            GROUP BY src_ip ORDER BY c DESC LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [(r["src_ip"], int(r["c"])) for r in rows]
+# ─── Alerts ──────────────────────────────────────────────────────
+def insert_alert(a: AlertRecord) -> int:
+    """Insert an alert record and return its row id."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO alerts
+              (timestamp, severity, src_ip, dst_ip, dst_port, protocol, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                a.timestamp, a.severity, a.src_ip, a.dst_ip,
+                a.dst_port, a.protocol, a.message,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+def get_recent_alerts(limit: int = 100) -> list[AlertRecord]:
+    """Return the most recent alerts ordered by time desc."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [
+        AlertRecord(
+            id=r["id"], timestamp=r["timestamp"], severity=r["severity"],
+            src_ip=r["src_ip"], dst_ip=r["dst_ip"], dst_port=r["dst_port"],
+            protocol=r["protocol"], message=r["message"],
+        )
+        for r in rows
+    ]
+def get_alert_counts_by_severity() -> dict[str, int]:
+    """Return a dict mapping severity -> count."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT severity, COUNT(*) AS c FROM alerts GROUP BY severity"
+        ).fetchall()
+    return {r["severity"]: int(r["c"]) for r in rows}
+# ─── Baseline ────────────────────────────────────────────────────
+def _row_to_baseline(r: sqlite3.Row) -> BaselineEntry:
+    """Convert a DB row into a BaselineEntry."""
+    try:
+        byte_history = json.loads(r["byte_history_json"] or "[]")
+    except json.JSONDecodeError:
+        byte_history = []
+    try:
+        rate_window = json.loads(r["rate_window_json"] or "[]")
+    except json.JSONDecodeError:
+        rate_window = []
+    return BaselineEntry(
+        id=r["id"], dst_port=r["dst_port"], protocol=r["protocol"],
+        hit_count=r["hit_count"], total_bytes=r["total_bytes"],
+        byte_history=byte_history, rate_window=rate_window,
+        first_seen=r["first_seen"], last_seen=r["last_seen"],
+    )
+def get_baseline_entry(dst_port: int, protocol: str) -> BaselineEntry | None:
+    """Fetch a baseline entry for (dst_port, protocol), or None."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM baseline WHERE dst_port=? AND protocol=?",
+            (int(dst_port), protocol),
+        ).fetchone()
+    return _row_to_baseline(row) if row else None
+def get_all_baseline() -> list[BaselineEntry]:
+    """Return all baseline entries ordered by hit_count desc."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM baseline ORDER BY hit_count DESC"
+        ).fetchall()
+    return [_row_to_baseline(r) for r in rows]
+def upsert_baseline(entry: BaselineEntry) -> None:
+    """Insert or update a baseline entry."""
+    byte_history = entry.byte_history[-MAX_BYTE_HISTORY:]
+    rate_window = entry.rate_window[-MAX_RATE_SAMPLES:]
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO baseline
+              (dst_port, protocol, hit_count, total_bytes,
+               byte_history_json, rate_window_json, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dst_port, protocol) DO UPDATE SET
+              hit_count=excluded.hit_count,
+              total_bytes=excluded.total_bytes,
+              byte_history_json=excluded.byte_history_json,
+              rate_window_json=excluded.rate_window_json,
+              last_seen=excluded.last_seen
+            """,
+            (
+                int(entry.dst_port), entry.protocol, int(entry.hit_count),
+                int(entry.total_bytes), json.dumps(byte_history),
+                json.dumps(rate_window),
+                entry.first_seen or now_timestamp(),
+                entry.last_seen or now_timestamp(),
+            ),
+        )
+# ─── Maintenance ─────────────────────────────────────────────────
+def clear_all() -> None:
+    """Delete all rows from packets, alerts, and baseline."""
+    with _connect() as conn:
+        conn.execute("DELETE FROM packets")
+        conn.execute("DELETE FROM alerts")
+        conn.execute("DELETE FROM baseline")
+analyzer
+"""
+NetTrace — Traffic Analyzer
+===========================
+Classifies packets, stores them, and emits alerts for unknown/suspicious.
+"""
+from __future__ import annotations
+import config
+import database as db
+import reputation
+from baseline import classify_packet
+from models import AlertRecord, PacketRecord
+from utils import now_timestamp
+class TrafficAnalyzer:
+    """Analyze, classify, persist, and alert on incoming packets."""
+    def analyze(self, packet_info: dict) -> PacketRecord:
+        """Process a single packet dict from the scanner.
+        Args:
+            packet_info: {"src_ip","dst_ip","src_port","dst_port",
+                          "protocol","length"}
+        Returns:
+            The persisted PacketRecord.
+        """
+        src_ip = str(packet_info.get("src_ip", "0.0.0.0"))
+        dst_ip = str(packet_info.get("dst_ip", "0.0.0.0"))
+        src_port = int(packet_info.get("src_port", 0))
+        dst_port = int(packet_info.get("dst_port", 0))
+        protocol = str(packet_info.get("protocol", "OTHER")).upper()
+        length = int(packet_info.get("length", 0))
+        classification, reason = classify_packet(
+            dst_port=dst_port, protocol=protocol,
+            length=length, src_ip=src_ip,
+        )
+        rep = reputation.check(src_ip)
+        if rep.get("malicious"):
+            classification = config.CLASS_SUSPICIOUS
+            reason = f"{reason} | Reputation: {rep['source']} score={rep['score']}"
+        record = PacketRecord(
+            timestamp=now_timestamp(),
+            src_ip=src_ip, dst_ip=dst_ip,
+            src_port=src_port, dst_port=dst_port,
+            protocol=protocol, length=length,
+            classification=classification, reason=reason,
+        )
+        record.id = db.insert_packet(record)
+        if classification == config.CLASS_SUSPICIOUS:
+            self._alert(record, config.SEVERITY_HIGH)
+        elif classification == config.CLASS_UNKNOWN:
+            self._alert(record, config.SEVERITY_MEDIUM)
+        return record
+    @staticmethod
+    def _alert(record: PacketRecord, severity: str) -> None:
+        """Insert an alert row for a packet record."""
+        alert = AlertRecord(
+            timestamp=record.timestamp,
+            severity=severity,
+            src_ip=record.src_ip,
+            dst_ip=record.dst_ip,
+            dst_port=record.dst_port,
+            protocol=record.protocol,
+            message=(
+                f"{severity}: {record.classification} — {record.reason} "
+                f"({record.src_ip} → {record.dst_ip}:{record.dst_port}/{record.protocol}, "
+                f"{record.length} B)"
+            ),
+        )
+        db.insert_alert(alert)
+baseline.py
+"""
+NetTrace — Baseline Learning & Anomaly Detection
+================================================
+Statistical classification of packets vs learned (port, protocol) baselines.
+"""
+from __future__ import annotations
+import time
+import config
+import database as db
+from models import BaselineEntry
+def _prune_rate_window(window: list[float], now: float) -> list[float]:
+    """Drop rate samples older than RATE_WINDOW_SECONDS."""
+    cutoff = now - config.RATE_WINDOW_SECONDS
+    return [t for t in window if t >= cutoff]
+def classify_packet(
+    dst_port: int, protocol: str, length: int, src_ip: str
+) -> tuple[str, str]:
+    """Classify a packet.
+    Args:
+        dst_port: Destination port (ICMP uses 0).
+        protocol: "TCP" | "UDP" | "ICMP".
+        length: Packet payload length in bytes.
+        src_ip: Source IP (used for rate tracking).
+    Returns:
+        (classification, reason) where classification is one of
+        config.CLASS_KNOWN / CLASS_UNKNOWN / CLASS_SUSPICIOUS.
+    """
+    # Rule 1: Risky port
+    if dst_port in config.RISKY_PORTS:
+        return (
+            config.CLASS_SUSPICIOUS,
+            f"Risky port {dst_port} ({protocol})",
+        )
+    entry = db.get_baseline_entry(dst_port, protocol)
+    now = time.time()
+    # Rule 3: First-seen port
+    if entry is None:
+        entry = BaselineEntry(
+            dst_port=dst_port,
+            protocol=protocol,
+            hit_count=1,
+            total_bytes=length,
+            byte_history=[length],
+            rate_window=[now],
+            first_seen=_now_str(),
+            last_seen=_now_str(),
+        )
+        db.upsert_baseline(entry)
+        if dst_port in config.COMMON_PORTS:
+            return config.CLASS_KNOWN, "Common service port"
+        return config.CLASS_UNKNOWN, "First-seen port — learning"
+    # Update sliding rate window
+    entry.rate_window = _prune_rate_window(entry.rate_window, now)
+    entry.rate_window.append(now)
+    # Rule 6: Rate spike check
+    rate_per_min = len(entry.rate_window)
+    if (
+        entry.hit_count >= config.LEARNING_THRESHOLD
+        and rate_per_min >= config.RATE_SPIKE_MIN_PACKETS
+        and rate_per_min > config.RATE_SPIKE_MULTIPLIER * max(
+            1, entry.hit_count / 10
+        )
+    ):
+        entry.hit_count += 1
+        entry.total_bytes += length
+        entry.byte_history.append(length)
+        entry.last_seen = _now_str()
+        db.upsert_baseline(entry)
+        return (
+            config.CLASS_SUSPICIOUS,
+            f"Traffic spike ({rate_per_min} pkt/min from {src_ip})",
+        )
+    # Rule 4: Learning phase
+    if entry.hit_count < config.LEARNING_THRESHOLD:
+        entry.hit_count += 1
+        entry.total_bytes += length
+        entry.byte_history.append(length)
+        entry.last_seen = _now_str()
+        db.upsert_baseline(entry)
+        if dst_port in config.COMMON_PORTS:
+            return config.CLASS_KNOWN, "Common service port (learning)"
+        return (
+            config.CLASS_UNKNOWN,
+            f"Learning phase ({entry.hit_count}/{config.LEARNING_THRESHOLD})",
+        )
+    # Rule 5: Statistical outlier
+    mean = entry.mean_bytes()
+    stddev = entry.stddev_bytes()
+    if len(entry.byte_history) >= config.MIN_STDDEV_SAMPLES and stddev > 0:
+        z = (length - mean) / stddev
+        if z > config.ANOMALY_SIGMA:
+            entry.hit_count += 1
+            entry.total_bytes += length
+            entry.byte_history.append(length)
+            entry.last_seen = _now_str()
+            db.upsert_baseline(entry)
+            return (
+                config.CLASS_UNKNOWN,
+                f"Byte-size anomaly (z={z:.2f} > {config.ANOMALY_SIGMA})",
+            )
+    # Baseline established — update history
+    entry.hit_count += 1
+    entry.total_bytes += length
+    entry.byte_history.append(length)
+    entry.last_seen = _now_str()
+    db.upsert_baseline(entry)
+    return config.CLASS_KNOWN, "Baseline established"
+def _now_str() -> str:
+    """Local import to avoid circulars."""
+    from utils import now_timestamp
+    return now_timestamp()
+config.py
+"""
+NetTrace — Configuration Module
+================================
+Central configuration for the NetTrace Network Security Monitoring System.
+All tunables live here: paths, thresholds, risky/common ports, severities.
+"""
+from __future__ import annotations
+import os
+from pathlib import Path
+# ─── App metadata ────────────────────────────────────────────────
+APP_NAME: str = "NetTrace"
+APP_TITLE: str = "🛡️ NetTrace — Network Security Monitoring System"
+APP_SUBTITLE: str = "Unknown Network Traffic Detector"
+APP_VERSION: str = "1.0.0"
+APP_AUTHOR: str = "NetTrace Project"
+APP_LICENSE: str = "Educational use only"
+# ─── Directory structure ─────────────────────────────────────────
+BASE_DIR: Path = Path(__file__).resolve().parent
+DATA_DIR: Path = BASE_DIR / "data"
+REPORT_DIR: Path = BASE_DIR / "reports"
+REPORT_DIR_HTML: Path = REPORT_DIR / "html"
+REPORT_DIR_PDF: Path = REPORT_DIR / "pdf"
+TESTS_DIR: Path = BASE_DIR / "tests"
+for _d in (DATA_DIR, REPORT_DIR_HTML, REPORT_DIR_PDF, TESTS_DIR):
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+# ─── Database ────────────────────────────────────────────────────
+DB_PATH: Path = DATA_DIR / "nettrace.db"
+# ─── Baseline / anomaly ──────────────────────────────────────────
+LEARNING_THRESHOLD: int = 5
+ANOMALY_SIGMA: float = 3.0
+MIN_STDDEV_SAMPLES: int = 3
+RATE_WINDOW_SECONDS: int = 60
+RATE_SPIKE_MULTIPLIER: float = 3.0
+RATE_SPIKE_MIN_PACKETS: int = 20
+MAX_BYTE_HISTORY: int = 500
+MAX_RATE_SAMPLES: int = 200
+# ─── Port classification ─────────────────────────────────────────
+RISKY_PORTS: set[int] = {
+    23, 21, 135, 137, 138, 139, 445, 1433, 3306, 3389, 5900, 6667, 4444,
+}
+COMMON_PORTS: set[int] = {
+    20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 110, 123, 143, 161, 162,
+    179, 389, 443, 465, 514, 587, 636, 993, 995, 1080, 1194, 1433,
+    1521, 1723, 2049, 3306, 3389, 5060, 5222, 5353, 5432, 5900,
+    6379, 8080, 8443, 8888, 9200, 27017,
+}
+ICMP_PORT_SENTINEL: int = 0
+# ─── Labels ──────────────────────────────────────────────────────
+CLASS_KNOWN: str = "KNOWN"
+CLASS_UNKNOWN: str = "UNKNOWN"
+CLASS_SUSPICIOUS: str = "SUSPICIOUS"
+ALL_CLASSES: tuple[str, ...] = (CLASS_KNOWN, CLASS_UNKNOWN, CLASS_SUSPICIOUS)
+SEVERITY_LOW: str = "LOW"
+SEVERITY_MEDIUM: str = "MEDIUM"
+SEVERITY_HIGH: str = "HIGH"
+SEVERITY_CRITICAL: str = "CRITICAL"
+ALL_SEVERITIES: tuple[str, ...] = (
+    SEVERITY_LOW, SEVERITY_MEDIUM, SEVERITY_HIGH, SEVERITY_CRITICAL,
+)
+# ─── Scanner / UI ────────────────────────────────────────────────
+CAPTURE_FILTER: str = "ip"
+CAPTURE_TIMEOUT: float = 1.0
+UI_MAX_ROWS: int = 100
+UI_REFRESH_INTERVAL: float = 1.0
+# ─── Reputation (offline by default) ────────────────────────────
+REPUTATION_ENABLED: bool = False
+REPUTATION_PROVIDER: str = "none"   # "virustotal" | "abuseipdb" | "none"
+VIRUSTOTAL_API_KEY: str = ""
+ABUSEIPDB_API_KEY: str = ""
+REPUTATION_TIMEOUT: int = 5
+REPUTATION_CACHE_TTL: int = 3600
+REPUTATION_MALICIOUS_THRESHOLD: int = 50
+# ─── Reporting ───────────────────────────────────────────────────
+REPORT_MAX_ALERT_ROWS: int = 60
+REPORT_MAX_PACKET_ROWS: int = 100
+REPORT_AUTHOR: str = "NetTrace Security Engine"
+RISK_WEIGHT_SUSPICIOUS: int = 10
+RISK_WEIGHT_UNKNOWN: int = 3
+RISK_WEIGHT_ALERT_HIGH: int = 8
+RISK_WEIGHT_ALERT_MEDIUM: int = 3
+RISK_LOW_MAX: int = 20
+RISK_MEDIUM_MAX: int = 60
+# ─── Time ────────────────────────────────────────────────────────
+TIMESTAMP_FORMAT: str = "%Y-%m-%d %H:%M:%S"
+FILENAME_TIMESTAMP_FORMAT: str = "%Y%m%d_%H%M%S"
+report_html.py
+"""
+NetTrace — HTML Report Generator
+================================
+Self-contained HTML report with embedded CSS and zebra tables.
+"""
+from __future__ import annotations
+import html
+from pathlib import Path
+from typing import Any
+import config
+import database as db
+from utils import filename_timestamp, now_timestamp, open_path
+def _risk_level(score: int) -> tuple[str, str]:
+    """Return (label, css_class) for a risk score."""
+    if score <= config.RISK_LOW_MAX:
+        return "LOW", "risk-low"
+    if score <= config.RISK_MEDIUM_MAX:
+        return "MEDIUM", "risk-medium"
+    return "HIGH", "risk-high"
+def _compute_risk_score() -> int:
+    """Compute the aggregate risk score from stored data."""
+    total, unknown, suspicious = db.get_packet_stats()
+    sev = db.get_alert_counts_by_severity()
+    return (
+        suspicious * config.RISK_WEIGHT_SUSPICIOUS
+        + unknown * config.RISK_WEIGHT_UNKNOWN
+        + sev.get(config.SEVERITY_HIGH, 0) * config.RISK_WEIGHT_ALERT_HIGH
+        + sev.get(config.SEVERITY_MEDIUM, 0) * config.RISK_WEIGHT_ALERT_MEDIUM
+    )
+_CSS = """
+* { box-sizing: border-box; }
+body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+       margin: 0; padding: 0; background: #f4f6f8; color: #2c3e50; }
+.header { background: #2c3e50; color: #fff; padding: 24px 32px; }
+.header h1 { margin: 0; font-size: 26px; }
+.header .meta { opacity: .8; font-size: 13px; margin-top: 6px; }
+.container { max-width: 1100px; margin: 0 auto; padding: 24px 32px; }
+.risk { padding: 14px 20px; border-radius: 8px; margin-bottom: 20px;
+        font-weight: 600; font-size: 16px; color: #fff; }
+.risk-low { background: #27ae60; }
+.risk-medium { background: #e67e22; }
+.risk-high { background: #c0392b; }
+.cards { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 24px; }
+.card { flex: 1; min-width: 160px; background: #fff; border-radius: 8px;
+        padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.card .label { font-size: 12px; color: #7f8c8d; text-transform: uppercase; }
+.card .value { font-size: 26px; font-weight: 700; margin-top: 6px; }
+h2 { color: #2c3e50; border-bottom: 2px solid #ecf0f1;
+     padding-bottom: 6px; margin-top: 32px; }
+table { width: 100%; border-collapse: collapse; background: #fff;
+        box-shadow: 0 1px 3px rgba(0,0,0,.05); border-radius: 6px;
+        overflow: hidden; font-size: 13px; }
+th { background: #34495e; color: #fff; text-align: left;
+     padding: 10px; font-weight: 600; }
+td { padding: 8px 10px; border-top: 1px solid #ecf0f1; }
+tr:nth-child(even) td { background: #f9fbfd; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px;
+       font-size: 11px; font-weight: 600; }
+.tag-known { background: #d4efdf; color: #1e8449; }
+.tag-unknown { background: #fdebd0; color: #b9770e; }
+.tag-suspicious { background: #fadbd8; color: #922b21; }
+.sev-HIGH, .sev-CRITICAL { color: #c0392b; font-weight: 700; }
+.sev-MEDIUM { color: #e67e22; font-weight: 700; }
+.sev-LOW { color: #27ae60; font-weight: 700; }
+ul { line-height: 1.7; }
+.footer { text-align: center; color: #95a5a6; padding: 24px;
+          font-size: 12px; }
+"""
+def _esc(v: Any) -> str:
+    """HTML-escape a value."""
+    return html.escape(str(v if v is not None else ""))
+def _tag(cls: str) -> str:
+    """Render a classification tag span."""
+    key = cls.lower()
+    return f'<span class="tag tag-{key}">{_esc(cls)}</span>'
+def generate_html_report() -> str:
+    """Build an HTML report, save it, open it, and return its path."""
+    total, unknown, suspicious = db.get_packet_stats()
+    known = total - unknown - suspicious
+    alerts = db.get_recent_alerts(config.REPORT_MAX_ALERT_ROWS)
+    packets = db.get_recent_packets(config.REPORT_MAX_PACKET_ROWS)
+    baseline = db.get_all_baseline()
+    protocols = db.get_protocol_stats()
+    sources = db.get_top_unknown_sources(20)
+    score = _compute_risk_score()
+    label, css = _risk_level(score)
+    parts: list[str] = []
+    parts.append("<!DOCTYPE html><html><head><meta charset='utf-8'>")
+    parts.append(f"<title>{_esc(config.APP_TITLE)}</title>")
+    parts.append(f"<style>{_CSS}</style></head><body>")
+    parts.append(
+        f"<div class='header'><h1>🛡️ {_esc(config.APP_NAME)} Security Report</h1>"
+        f"<div class='meta'>Generated: {_esc(now_timestamp())} · "
+        f"v{_esc(config.APP_VERSION)}</div></div>"
+    )
+    parts.append("<div class='container'>")
+    parts.append(
+        f"<div class='risk {css}'>Overall Risk: {label} "
+        f"(score {score})</div>"
+    )
+    # Summary cards
+    parts.append("<div class='cards'>")
+    for lbl, val in (("Total Packets", total), ("Known", known),
+                     ("Unknown", unknown), ("Suspicious", suspicious)):
+        parts.append(
+            f"<div class='card'><div class='label'>{_esc(lbl)}</div>"
+            f"<div class='value'>{val}</div></div>"
+        )
+    parts.append("</div>")
+    # Protocol stats
+    parts.append("<h2>Protocol Statistics</h2><table>")
+    parts.append("<tr><th>Protocol</th><th>Count</th></tr>")
+    for proto, count in protocols:
+        parts.append(f"<tr><td>{_esc(proto)}</td><td>{count}</td></tr>")
+    parts.append("</table>")
+    # Top unknown sources
+    parts.append("<h2>Top Unknown / Suspicious Sources</h2><table>")
+    parts.append("<tr><th>Source IP</th><th>Packets</th></tr>")
+    for ip, count in sources:
+        parts.append(f"<tr><td>{_esc(ip)}</td><td>{count}</td></tr>")
+    parts.append("</table>")
+    # Alerts
+    parts.append("<h2>Recent Security Alerts</h2><table>")
+    parts.append(
+        "<tr><th>Time</th><th>Severity</th><th>Source</th>"
+        "<th>Destination</th><th>Message</th></tr>"
+    )
+    for a in alerts:
+        parts.append(
+            f"<tr><td>{_esc(a.timestamp)}</td>"
+            f"<td class='sev-{_esc(a.severity)}'>{_esc(a.severity)}</td>"
+            f"<td>{_esc(a.src_ip)}</td>"
+            f"<td>{_esc(a.dst_ip)}:{a.dst_port}/{_esc(a.protocol)}</td>"
+            f"<td>{_esc(a.message)}</td></tr>"
+        )
+    parts.append("</table>")
+    # Recent packets
+    parts.append("<h2>Recent Traffic</h2><table>")
+    parts.append(
+        "<tr><th>Time</th><th>Source</th><th>Destination</th>"
+        "<th>Proto</th><th>Len</th><th>Class</th><th>Reason</th></tr>"
+    )
+    for p in packets:
+        parts.append(
+            f"<tr><td>{_esc(p.timestamp)}</td>"
+            f"<td>{_esc(p.src_ip)}:{p.src_port}</td>"
+            f"<td>{_esc(p.dst_ip)}:{p.dst_port}</td>"
+            f"<td>{_esc(p.protocol)}</td><td>{p.length}</td>"
+            f"<td>{_tag(p.classification)}</td>"
+            f"<td>{_esc(p.reason)}</td></tr>"
+        )
+    parts.append("</table>")
+    # Baseline
+    parts.append("<h2>Learned Baseline</h2><table>")
+    parts.append(
+        "<tr><th>Port</th><th>Proto</th><th>Hits</th>"
+        "<th>First Seen</th><th>Last Seen</th></tr>"
+    )
+    for b in baseline:
+        parts.append(
+            f"<tr><td>{b.dst_port}</td><td>{_esc(b.protocol)}</td>"
+            f"<td>{b.hit_count}</td><td>{_esc(b.first_seen)}</td>"
+            f"<td>{_esc(b.last_seen)}</td></tr>"
+        )
+    parts.append("</table>")
+    # Recommendations
+    parts.append("<h2>Recommendations</h2><ul>")
+    recs = []
+    if suspicious:
+        recs.append(
+            f"Investigate {suspicious} SUSPICIOUS packets — check risky ports "
+            "and reputation of the source IPs listed above."
+        )
+    if unknown:
+        recs.append(
+            f"Review {unknown} UNKNOWN packets. If they come from trusted "
+            "hosts, they will be promoted to KNOWN after learning."
+        )
+    if not recs:
+        recs.append("No anomalies detected in this capture window.")
+    recs.append("Restrict inbound access to risky ports (23, 445, 3389, …).")
+    recs.append("Enable IP reputation lookups in config.py for enrichment.")
+    recs.append("Re-run capture during peak hours to widen the baseline.")
+    for r in recs:
+        parts.append(f"<li>{_esc(r)}</li>")
+    parts.append("</ul>")
+    parts.append(
+        "<div class='footer'>NetTrace — Network Security Monitoring System "
+        "· Educational use only</div>"
+    )
+    parts.append("</div></body></html>")
+    out_path = Path(config.REPORT_DIR_HTML) / (
+        f"nettrace_report_{filename_timestamp()}.html"
+    )
+    out_path.write_text("".join(parts), encoding="utf-8")
+    try:
+        open_path(out_path)
+    except Exception:
+        pass
+    print(f"[NetTrace] HTML report: {out_path}")
+    return str(out_path)
+report_pdf.py
+"""
+NetTrace — PDF Report Generator (reportlab)
+===========================================
+Professional A4 report with risk banner, summary cards, zebra tables.
+"""
+from __future__ import annotations
+from pathlib import Path
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, PageBreak,
+)
+import config
+import database as db
+from utils import filename_timestamp, now_timestamp, open_path
+_HEADER_BG = colors.HexColor("#34495e")
+_ZEBRA = colors.HexColor("#f9fbfd")
+_GRID = colors.HexColor("#ecf0f1")
+def _risk_level(score: int) -> tuple[str, colors.Color]:
+    """Return (label, color) for a risk score."""
+    if score <= config.RISK_LOW_MAX:
+        return "LOW", colors.HexColor("#27ae60")
+    if score <= config.RISK_MEDIUM_MAX:
+        return "MEDIUM", colors.HexColor("#e67e22")
+    return "HIGH", colors.HexColor("#c0392b")
+def _compute_risk_score() -> int:
+    """Compute the aggregate risk score from stored data."""
+    _, unknown, suspicious = db.get_packet_stats()
+    sev = db.get_alert_counts_by_severity()
+    return (
+        suspicious * config.RISK_WEIGHT_SUSPICIOUS
+        + unknown * config.RISK_WEIGHT_UNKNOWN
+        + sev.get(config.SEVERITY_HIGH, 0) * config.RISK_WEIGHT_ALERT_HIGH
+        + sev.get(config.SEVERITY_MEDIUM, 0) * config.RISK_WEIGHT_ALERT_MEDIUM
+    )
+def _table(rows: list[list[str]], col_widths: list[float]) -> Table:
+    """Build a zebra-striped, dark-header table."""
+    data = [[Paragraph(str(c), _cell_style(header=True)) for c in rows[0]]]
+    for r in rows[1:]:
+        data.append([Paragraph(str(c), _cell_style(header=False)) for c in r])
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), _HEADER_BG),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.25, _GRID),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+    for i in range(1, len(data)):
+        if i % 2 == 0:
+            style.append(("BACKGROUND", (0, i), (-1, i), _ZEBRA))
+    t.setStyle(TableStyle(style))
+    return t
+def _cell_style(header: bool) -> ParagraphStyle:
+    """Return a Paragraph style for table cells."""
+    return ParagraphStyle(
+        name="cell-h" if header else "cell",
+        fontName="Helvetica-Bold" if header else "Helvetica",
+        fontSize=8,
+        textColor=colors.white if header else colors.black,
+        leading=10,
+    )
+def generate_pdf_report() -> str:
+    """Build a PDF report, save it, open it, and return its path."""
+    total, unknown, suspicious = db.get_packet_stats()
+    known = total - unknown - suspicious
+    alerts = db.get_recent_alerts(config.REPORT_MAX_ALERT_ROWS)
+    packets = db.get_recent_packets(config.REPORT_MAX_PACKET_ROWS)
+    baseline = db.get_all_baseline()
+    protocols = db.get_protocol_stats()
+    sources = db.get_top_unknown_sources(20)
+    score = _compute_risk_score()
+    label, color = _risk_level(score)
+    out_path = Path(config.REPORT_DIR_PDF) / (
+        f"nettrace_report_{filename_timestamp()}.pdf"
+    )
+    doc = SimpleDocTemplate(
+        str(out_path), pagesize=A4,
+        leftMargin=1.8 * cm, rightMargin=1.8 * cm,
+        topMargin=1.8 * cm, bottomMargin=1.8 * cm,
+        title="NetTrace Security Report",
+    )
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("H1", parent=styles["Heading1"],
+                        textColor=_HEADER_BG, fontSize=18, spaceAfter=4)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"],
+                        textColor=_HEADER_BG, fontSize=13, spaceBefore=14,
+                        spaceAfter=6)
+    body = styles["BodyText"]
+    story: list = []
+    story.append(Paragraph("🛡️ NetTrace Security Report", h1))
+    story.append(Paragraph(
+        f"Generated: {now_timestamp()} · v{config.APP_VERSION}", body))
+    story.append(Spacer(1, 10))
+    # Risk banner
+    banner = Table(
+        [[Paragraph(
+            f"<b>Overall Risk: {label}</b> &nbsp; (score {score})",
+            ParagraphStyle("banner", fontName="Helvetica-Bold",
+                           fontSize=11, textColor=colors.white),
+        )]],
+        colWidths=[doc.width],
+    )
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), color),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(banner)
+    story.append(Spacer(1, 12))
+    # Summary cards
+    story.append(Paragraph("Summary", h2))
+    summary_rows = [[
+        "Total Packets", "Known", "Unknown", "Suspicious",
+    ], [str(total), str(known), str(unknown), str(suspicious)]]
+    story.append(_table(summary_rows, [doc.width / 4] * 4))
+    story.append(Spacer(1, 8))
+    # Protocol stats
+    story.append(Paragraph("Protocol Statistics", h2))
+    if protocols:
+        rows = [["Protocol", "Count"]] + [[p, str(c)] for p, c in protocols]
+        story.append(_table(rows, [doc.width * 0.6, doc.width * 0.4]))
+    # Unknown sources
+    story.append(Paragraph("Top Unknown / Suspicious Sources", h2))
+    if sources:
+        rows = [["Source IP", "Packets"]] + [[ip, str(c)] for ip, c in sources]
+        story.append(_table(rows, [doc.width * 0.6, doc.width * 0.4]))
+    story.append(PageBreak())
+    # Alerts
+    story.append(Paragraph("Security Alerts", h2))
+    if alerts:
+        rows = [["Time", "Severity", "Source", "Destination", "Message"]]
+        for a in alerts:
+            rows.append([
+                a.timestamp, a.severity, a.src_ip,
+                f"{a.dst_ip}:{a.dst_port}/{a.protocol}",
+                a.message,
+            ])
+        widths = [
+            doc.width * 0.16, doc.width * 0.09, doc.width * 0.14,
+            doc.width * 0.16, doc.width * 0.45,
+        ]
+        story.append(_table(rows, widths))
+    else:
+        story.append(Paragraph("No alerts recorded.", body))
+    # Recent packets
+    story.append(Paragraph("Recent Traffic", h2))
+    if packets:
+        rows = [["Time", "Source", "Destination", "Proto", "Len",
+                 "Class", "Reason"]]
+        for p in packets:
+            rows.append([
+                p.timestamp, f"{p.src_ip}:{p.src_port}",
+                f"{p.dst_ip}:{p.dst_port}", p.protocol, str(p.length),
+                p.classification, p.reason,
+            ])
+        widths = [
+            doc.width * 0.15, doc.width * 0.15, doc.width * 0.15,
+            doc.width * 0.08, doc.width * 0.07, doc.width * 0.12,
+            doc.width * 0.28,
+        ]
+        story.append(_table(rows, widths))
+    else:
+        story.append(Paragraph("No packets recorded.", body))
+    # Baseline
+    story.append(Paragraph("Learned Baseline", h2))
+    if baseline:
+        rows = [["Port", "Proto", "Hits", "First Seen", "Last Seen"]]
+        for b in baseline:
+            rows.append([
+                str(b.dst_port), b.protocol, str(b.hit_count),
+                b.first_seen, b.last_seen,
+            ])
+        widths = [
+            doc.width * 0.12, doc.width * 0.12, doc.width * 0.12,
+            doc.width * 0.32, doc.width * 0.32,
+        ]
+        story.append(_table(rows, widths))
+    else:
+        story.append(Paragraph("No baseline entries yet.", body))
+    # Recommendations
+    story.append(Paragraph("Recommendations", h2))
+    recs: list[str] = []
+    if suspicious:
+        recs.append(
+            f"Investigate {suspicious} SUSPICIOUS packets — focus on risky "
+            "ports and the source IPs listed above."
+        )
+    if unknown:
+        recs.append(
+            f"Review {unknown} UNKNOWN packets; trusted ports will be "
+            "promoted to KNOWN after the learning threshold."
+        )
+    if not recs:
+        recs.append("No anomalies detected in this capture window.")
+    recs.extend([
+        "Block inbound traffic to risky ports (23, 445, 3389, 5900, …).",
+        "Enable reputation lookups in config.py for source enrichment.",
+        "Re-run capture during peak hours to widen the baseline.",
+    ])
+    for r in recs:
+        story.append(Paragraph(f"• {r}", body))
+    story.append(Spacer(1, 18))
+    story.append(Paragraph(
+        "<i>NetTrace — Network Security Monitoring System · "
+        "Educational use only</i>",
+        ParagraphStyle("footer", parent=body, fontSize=8,
+                       textColor=colors.grey, alignment=1),
+    ))
+    doc.build(story)
+    try:
+        open_path(out_path)
+    except Exception:
+        pass
+    print(f"[NetTrace] PDF report: {out_path}")
+    return str(out_path)
+reputation.py
+"""
+NetTrace — IP Reputation Lookup (Optional)
+==========================================
+Offline-safe stub. Enable real API calls via config.REPUTATION_ENABLED.
+"""
+from __future__ import annotations
+import json
+import time
+import urllib.error
+import urllib.request
+import config
+_CACHE: dict[str, tuple[float, dict]] = {}
+def _cache_get(ip: str) -> dict | None:
+    """Return a cached reputation result if still fresh."""
+    hit = _CACHE.get(ip)
+    if not hit:
+        return None
+    ts, data = hit
+    if time.time() - ts > config.REPUTATION_CACHE_TTL:
+        _CACHE.pop(ip, None)
+        return None
+    return data
+def _cache_set(ip: str, data: dict) -> None:
+    """Store a reputation result in the in-memory cache."""
+    _CACHE[ip] = (time.time(), data)
+def check(ip: str) -> dict:
+    """Look up an IP's reputation.
+    Always returns a dict with at least:
+      {"ip": str, "score": int, "malicious": bool, "source": str}
+    When reputation is disabled (default) it returns a neutral result
+    without any network access.
+    """
+    if not config.REPUTATION_ENABLED or config.REPUTATION_PROVIDER == "none":
+        return {
+            "ip": ip,
+            "score": 0,
+            "malicious": False,
+            "source": "disabled",
+        }
+    cached = _cache_get(ip)
+    if cached is not None:
+        return cached
+    provider = config.REPUTATION_PROVIDER
+    try:
+        if provider == "virustotal":
+            result = _query_virustotal(ip)
+        elif provider == "abuseipdb":
+            result = _query_abuseipdb(ip)
+        else:
+            result = {"ip": ip, "score": 0, "malicious": False,
+                      "source": "unknown-provider"}
+    except Exception as exc:
+        result = {
+            "ip": ip, "score": 0, "malicious": False,
+            "source": f"error:{type(exc).__name__}",
+        }
+    _cache_set(ip, result)
+    return result
+def _query_virustotal(ip: str) -> dict:
+    """Query the VirusTotal v3 API for an IP address."""
+    if not config.VIRUSTOTAL_API_KEY:
+        return {"ip": ip, "score": 0, "malicious": False,
+                "source": "virustotal:no-key"}
+    url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+    req = urllib.request.Request(
+        url, headers={"x-apikey": config.VIRUSTOTAL_API_KEY}
+    )
+    with urllib.request.urlopen(req, timeout=config.REPUTATION_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    stats = (
+        data.get("data", {}).get("attributes", {})
+        .get("last_analysis_stats", {})
+    )
+    score = int(stats.get("malicious", 0)) * 10
+    return {
+        "ip": ip, "score": score,
+        "malicious": score >= config.REPUTATION_MALICIOUS_THRESHOLD,
+        "source": "virustotal",
+    }
+def _query_abuseipdb(ip: str) -> dict:
+    """Query the AbuseIPDB v2 API for an IP address."""
+    if not config.ABUSEIPDB_API_KEY:
+        return {"ip": ip, "score": 0, "malicious": False,
+                "source": "abuseipdb:no-key"}
+    url = (
+        "https://api.abuseipdb.com/api/v2/check"
+        f"?ipAddress={ip}&maxAgeInDays=90"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Key": config.ABUSEIPDB_API_KEY,
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=config.REPUTATION_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    score = int(data.get("data", {}).get("abuseConfidenceScore", 0))
+    return {
+        "ip": ip, "score": score,
+        "malicious": score >= config.REPUTATION_MALICIOUS_THRESHOLD,
+        "source": "abuseipdb",
+    }
+scanner.py
+"""
+NetTrace — Packet Capture Engine (Scapy)
+========================================
+Sniffs TCP/UDP/ICMP metadata in a daemon thread. No payload capture.
+"""
+from __future__ import annotations
+import threading
+from typing import Callable
+try:
+    from scapy.all import ICMP, IP, TCP, UDP, sniff  # type: ignore
+    SCAPY_AVAILABLE = True
+except Exception:  # pragma: no cover
+    SCAPY_AVAILABLE = False
+    sniff = None  # type: ignore
+class PacketScanner:
+    """Background Scapy sniffer that emits packet metadata dicts."""
+    def __init__(self, callback: Callable[[dict], None]) -> None:
+        """Initialise the scanner with a callback for each packet."""
+        self.callback = callback
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._running = False
+    def start(self) -> None:
+        """Start the sniffer in a daemon thread."""
+        if self._running:
+            return
+        if not SCAPY_AVAILABLE:
+            raise RuntimeError(
+                "Scapy is not installed. Run: pip install scapy"
+            )
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="NetTrace-Sniffer", daemon=True
+        )
+        self._thread.start()
+        self._running = True
+    def stop(self) -> None:
+        """Signal the sniffer thread to stop and wait briefly."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        self._running = False
+        self._thread = None
+    @property
+    def is_running(self) -> bool:
+        """Return True if the sniffer thread is active."""
+        return self._running
+    def _run(self) -> None:
+        """Main sniff loop with periodic timeout to honour stop()."""
+        try:
+            from config import CAPTURE_FILTER, CAPTURE_TIMEOUT
+            while not self._stop_event.is_set():
+                sniff(
+                    filter=CAPTURE_FILTER,
+                    prn=self._handle_packet,
+                    store=False,
+                    timeout=CAPTURE_TIMEOUT,
+                )
+        except Exception as exc:  # pragma: no cover
+            print(f"[NetTrace] Scanner error: {exc}")
+        finally:
+            self._running = False
+    def _handle_packet(self, pkt) -> None:  # noqa: ANN001
+        """Extract metadata from a Scapy packet and invoke callback."""
+        try:
+            if IP not in pkt:
+                return
+            ip_layer = pkt[IP]
+            src_ip = str(ip_layer.src)
+            dst_ip = str(ip_layer.dst)
+            length = int(len(pkt))
+            protocol = "OTHER"
+            src_port = 0
+            dst_port = 0
+            if TCP in pkt:
+                protocol = "TCP"
+                src_port = int(pkt[TCP].sport)
+                dst_port = int(pkt[TCP].dport)
+            elif UDP in pkt:
+                protocol = "UDP"
+                src_port = int(pkt[UDP].sport)
+                dst_port = int(pkt[UDP].dport)
+            elif ICMP in pkt:
+                protocol = "ICMP"
+            else:
+                return
+            self.callback({
+                "src_ip": src_ip, "dst_ip": dst_ip,
+                "src_port": src_port, "dst_port": dst_port,
+                "protocol": protocol, "length": length,
+            })
+        except Exception:
+            return
+utils.py
+"""
+NetTrace — Utility Helpers
+==========================
+Timestamps, path helpers, cross-platform file openers, safe conversions.
+"""
+from __future__ import annotations
+import os
+import platform
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from config import FILENAME_TIMESTAMP_FORMAT, TIMESTAMP_FORMAT
+def now_timestamp() -> str:
+    """Return the current local time as a formatted string."""
+    return datetime.now().strftime(TIMESTAMP_FORMAT)
+def filename_timestamp() -> str:
+    """Return a compact timestamp suitable for filenames."""
+    return datetime.now().strftime(FILENAME_TIMESTAMP_FORMAT)
+def ensure_dir(path: Path | str) -> Path:
+    """Create a directory (and parents) if it does not exist."""
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+def safe_int(value: Any, default: int = 0) -> int:
+    """Best-effort conversion to int."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+def human_bytes(num: int | float) -> str:
+    """Format a byte count as a human-readable string."""
+    try:
+        n = float(num)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+def open_path(path: Path | str) -> None:
+    """Open a file or folder with the OS default application."""
+    p = Path(path)
+    target = str(p)
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+    except Exception as exc:  # pragma: no cover
+        print(f"[NetTrace] Could not open {target!r}: {exc}", file=sys.stderr)
+def truncate(text: str, width: int = 60) -> str:
+    """Shorten a string with an ellipsis if it exceeds width."""
+    if len(text) <= width:
+        return text
+    return text[: max(0, width - 1)] + "…"
+main.py
+"""
+NetTrace — Premium Flet Dashboard
+=================================
+Real-desktop-app style dashboard with sidebar navigation, live charts,
+animated stat cards, toast notifications, and theme toggle.
+Professional dark theme — muted icon tiles, single accent color,
+subtle borders. No rainbow colors.
+Run:  python main.py   (needs admin/root for packet capture)
+"""
+from __future__ import annotations
+import math
+import threading
+import time
+import flet as ft
+import config
+import database as db
+from analyzer import TrafficAnalyzer
+from report_html import generate_html_report
+from report_pdf import generate_pdf_report
+from scanner import PacketScanner
+from utils import open_path
+# ═══════════════════════════════════════════════════════════════
+#  THEME  —  Professional slate palette
+# ═══════════════════════════════════════════════════════════════
+class Theme:
+    """Centralised professional palette — dark slate + muted accents."""
+    # Backgrounds
+    BG          = "#0B1120"
+    BG_ALT      = "#0F172A"
+    SIDEBAR     = "#080D1A"
+    CARD        = "#131C2E"
+    CARD_HOVER  = "#1A2438"
+    TILE        = "#1E293B"          # icon tile background
+    TILE_HOVER  = "#26344A"
+    # Borders
+    BORDER      = "#1F2A3D"
+    BORDER_SOFT = "#182236"
+    # Text
+    TEXT        = "#E2E8F0"
+    TEXT_MUTED  = "#94A3B8"
+    TEXT_DIM    = "#64748B"
+    # Single primary accent (cyan) + semantic muted tones
+    ACCENT      = "#22D3EE"
+    ACCENT_SOFT = "#0E7490"
+    SUCCESS     = "#34D399"
+    WARNING     = "#FBBF24"
+    DANGER      = "#F87171"
+    INFO        = "#60A5FA"
+    PURPLE      = "#A78BFA"
+    # Tint backgrounds for icon tiles (subtle, low-opacity feel)
+    TINT_ACCENT     = "#0E3A47"
+    TINT_SUCCESS    = "#0D3B32"
+    TINT_WARNING    = "#3D2E0D"
+    TINT_DANGER     = "#3D1A1A"
+    TINT_INFO       = "#0F2742"
+    TINT_PURPLE     = "#2A1F45"
+# ═══════════════════════════════════════════════════════════════
+#  MAIN APP
+# ═══════════════════════════════════════════════════════════════
+def main(page: ft.Page) -> None:
+    """Entry point for the NetTrace Flet dashboard."""
+    # ─── Page config ────────────────────────────────────────
+    page.title = config.APP_TITLE
+    page.theme_mode = ft.ThemeMode.DARK
+    page.bgcolor = Theme.BG
+    page.padding = 0
+    page.spacing = 0
+    page.window_width = 1400
+    page.window_height = 900
+    page.window_min_width = 1100
+    page.window_min_height = 700
+    db.init_db()
+    analyzer = TrafficAnalyzer()
+    scanner = PacketScanner(callback=lambda info: _on_packet(info))
+    state: dict = {
+        "packets": [],
+        "alerts": [],
+        "capturing": False,
+        "pulse": 0.0,
+        "view": "dashboard",
+    }
+    lock = threading.Lock()
+    # ─── Content / sidebar / status bar ─────────────────────
+    content_area = ft.Container(expand=True, padding=24)
+    sidebar = _build_sidebar(state)
+    status_bar = _build_status_bar()
+    # ─── Stat cards ─────────────────────────────────────────
+    stat_total = _stat_card(
+        "Total Packets", "0", ft.icons.LAYERS_ROUNDED,
+        Theme.ACCENT, Theme.TINT_ACCENT,
+    )
+    stat_known = _stat_card(
+        "Known", "0", ft.icons.VERIFIED_ROUNDED,
+        Theme.SUCCESS, Theme.TINT_SUCCESS,
+    )
+    stat_unknown = _stat_card(
+        "Unknown", "0", ft.icons.HELP_OUTLINE_ROUNDED,
+        Theme.WARNING, Theme.TINT_WARNING,
+    )
+    stat_suspicious = _stat_card(
+        "Suspicious", "0", ft.icons.WARNING_AMBER_ROUNDED,
+        Theme.DANGER, Theme.TINT_DANGER,
+    )
+    stats_row = ft.Row(
+        [stat_total, stat_known, stat_unknown, stat_suspicious],
+        spacing=14,
+    )
+    # ─── LIVE indicator ─────────────────────────────────────
+    live_dot = ft.Container(
+        width=8, height=8,
+        border_radius=4,
+        bgcolor=Theme.TEXT_DIM,
+        opacity=1.0,
+        animate_opacity=ft.animation.Animation(400,
+                                               ft.AnimationCurve.EASE_IN_OUT),
+    )
+    live_text = ft.Text("IDLE", color=Theme.TEXT_MUTED,
+                        size=10, weight=ft.FontWeight.BOLD)
+    # ─── Charts ─────────────────────────────────────────────
+    traffic_chart = _build_traffic_chart()
+    protocol_chart = _build_protocol_bars()
+    # ─── Lists ──────────────────────────────────────────────
+    packets_list = ft.ListView(expand=True, spacing=6, auto_scroll=False)
+    alerts_list = ft.ListView(expand=True, spacing=6, auto_scroll=False)
+    # ─── Handlers ───────────────────────────────────────────
+    def start_capture(e: ft.ControlEvent | None = None) -> None:
+        """Start the packet scanner thread."""
+        try:
+            if state["capturing"]:
+                return
+            scanner.start()
+            state["capturing"] = True
+            live_text.value = "LIVE"
+            live_text.color = Theme.SUCCESS
+            live_dot.bgcolor = Theme.SUCCESS
+            _toast(page, "Capture started — monitoring traffic",
+                   Theme.SUCCESS, ft.icons.PLAY_ARROW_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"Failed to start: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+        page.update()
+    def stop_capture(e: ft.ControlEvent | None = None) -> None:
+        """Stop the packet scanner thread."""
+        try:
+            scanner.stop()
+            state["capturing"] = False
+            live_text.value = "IDLE"
+            live_text.color = Theme.TEXT_MUTED
+            live_dot.bgcolor = Theme.TEXT_DIM
+            live_dot.opacity = 1.0
+            _toast(page, "Capture stopped", Theme.WARNING,
+                   ft.icons.STOP_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"Stop failed: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+        page.update()
+    def refresh_data(e: ft.ControlEvent | None = None) -> None:
+        """Reload data from the DB and refresh the UI."""
+        try:
+            _load_recent(state, lock)
+            _render_lists(packets_list, alerts_list, state, lock)
+            _update_stats(stat_total, stat_known, stat_unknown, stat_suspicious)
+            _update_charts(traffic_chart, protocol_chart)
+            _toast(page, "Data refreshed", Theme.INFO,
+                   ft.icons.REFRESH_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"Refresh failed: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+        page.update()
+    def make_pdf(e: ft.ControlEvent | None = None) -> None:
+        """Generate a PDF report."""
+        try:
+            path = generate_pdf_report()
+            _toast(page, f"PDF saved: {_basename(path)}",
+                   Theme.SUCCESS, ft.icons.PICTURE_AS_PDF_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"PDF failed: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+    def make_html(e: ft.ControlEvent | None = None) -> None:
+        """Generate an HTML report."""
+        try:
+            path = generate_html_report()
+            _toast(page, f"HTML saved: {_basename(path)}",
+                   Theme.SUCCESS, ft.icons.LANGUAGE_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"HTML failed: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+    def open_reports(e: ft.ControlEvent | None = None) -> None:
+        """Open the reports folder in the OS file manager."""
+        try:
+            open_path(config.REPORT_DIR)
+            _toast(page, "Reports folder opened", Theme.INFO,
+                   ft.icons.FOLDER_OPEN_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"Open failed: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+    def reset_db(e: ft.ControlEvent | None = None) -> None:
+        """Wipe all DB tables and reset the UI state."""
+        try:
+            db.clear_all()
+            with lock:
+                state["packets"].clear()
+                state["alerts"].clear()
+            packets_list.controls.clear()
+            alerts_list.controls.clear()
+            _update_stats(stat_total, stat_known, stat_unknown, stat_suspicious)
+            _update_charts(traffic_chart, protocol_chart)
+            _toast(page, "Database reset", Theme.WARNING,
+                   ft.icons.DELETE_SWEEP_ROUNDED)
+        except Exception as exc:
+            _toast(page, f"Reset failed: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+        page.update()
+    # ─── View switcher ──────────────────────────────────────
+    def render_view(view: str) -> None:
+        """Swap the content area to the requested view."""
+        try:
+            state["view"] = view
+            content_area.content = _build_view(
+                view, stats_row, packets_list, alerts_list,
+                traffic_chart, protocol_chart,
+                make_pdf, make_html, open_reports,
+            )
+            _highlight_sidebar(sidebar, view)
+            page.update()
+        except Exception as exc:
+            _toast(page, f"View error: {exc}", Theme.DANGER,
+                   ft.icons.ERROR_ROUNDED)
+    state["handlers"] = {"render_view": render_view}
+    # ─── Top action buttons ─────────────────────────────────
+    top_actions = ft.Row(
+        [
+            _action_button("Start", ft.icons.PLAY_ARROW_ROUNDED,
+                           Theme.SUCCESS, start_capture),
+            _action_button("Stop", ft.icons.STOP_ROUNDED,
+                           Theme.DANGER, stop_capture),
+            _action_button("Refresh", ft.icons.REFRESH_ROUNDED,
+                           Theme.ACCENT, refresh_data),
+            _action_button("PDF", ft.icons.PICTURE_AS_PDF_ROUNDED,
+                           Theme.PURPLE, make_pdf),
+            _action_button("HTML", ft.icons.LANGUAGE_ROUNDED,
+                           Theme.INFO, make_html),
+            _action_button("Reports", ft.icons.FOLDER_OPEN_ROUNDED,
+                           Theme.WARNING, open_reports),
+            _action_button("Reset", ft.icons.DELETE_SWEEP_ROUNDED,
+                           Theme.TEXT_MUTED, reset_db),
+        ],
+        spacing=8,
+    )
+    header = _build_header(top_actions, live_dot, live_text)
+    # ─── Packet callback ────────────────────────────────────
+    def _on_packet(packet_info: dict) -> None:
+        """Handle a packet emitted by the scanner thread."""
+        try:
+            record = analyzer.analyze(packet_info)
+            with lock:
+                state["packets"].insert(0, record)
+                state["packets"] = state["packets"][:config.UI_MAX_ROWS]
+                if record.classification != config.CLASS_KNOWN:
+                    state["alerts"].insert(0, {
+                        "time": record.timestamp,
+                        "severity": ("HIGH"
+                                     if record.classification
+                                     == config.CLASS_SUSPICIOUS
+                                     else "MEDIUM"),
+                        "msg": (f"{record.src_ip} → {record.dst_ip}:"
+                                f"{record.dst_port}/{record.protocol}  "
+                                f"{record.reason}"),
+                    })
+                    state["alerts"] = state["alerts"][:config.UI_MAX_ROWS]
+        except Exception:
+            pass
+    # ─── Layout skeleton ────────────────────────────────────
+    page.add(
+        ft.Column(
+            [
+                header,
+                ft.Row(
+                    [
+                        sidebar,
+                        ft.Column(
+                            [content_area, status_bar],
+                            expand=True, spacing=0,
+                        ),
+                    ],
+                    expand=True, spacing=0,
+                ),
+            ],
+            expand=True, spacing=0,
+        )
+    )
+    # ─── Boot ───────────────────────────────────────────────
+    _load_recent(state, lock)
+    _render_lists(packets_list, alerts_list, state, lock)
+    _update_stats(stat_total, stat_known, stat_unknown, stat_suspicious)
+    _update_charts(traffic_chart, protocol_chart)
+    render_view("dashboard")
+    # ─── Live refresh loop ──────────────────────────────────
+    def _ticker() -> None:
+        """Background loop for animations + periodic UI updates."""
+        counter = 0
+        while True:
+            time.sleep(config.UI_REFRESH_INTERVAL)
+            counter += 1
+            try:
+                if state["capturing"]:
+                    state["pulse"] = (state["pulse"] + 0.5) % 2.0
+                    alpha = 0.4 + 0.6 * abs(math.sin(state["pulse"] * math.pi))
+                    try:
+                        live_dot.opacity = alpha
+                    except Exception:
+                        pass
+                _render_lists(packets_list, alerts_list, state, lock)
+                if counter % 2 == 0:
+                    _update_stats(stat_total, stat_known,
+                                  stat_unknown, stat_suspicious)
+                    _update_charts(traffic_chart, protocol_chart)
+                page.update()
+            except Exception:
+                pass
+    threading.Thread(target=_ticker, daemon=True).start()
+# ═══════════════════════════════════════════════════════════════
+#  HEADER / SIDEBAR / STATUS BAR
+# ═══════════════════════════════════════════════════════════════
+def _build_header(top_actions: ft.Row,
+                  live_dot: ft.Container,
+                  live_text: ft.Text) -> ft.Container:
+    """Top header bar with logo tile, actions, and live badge."""
+    # Logo icon tile — professional dark tile with cyan tint
+    logo_tile = ft.Container(
+        content=ft.Icon(ft.icons.SHIELD_ROUNDED, size=20,
+                        color=Theme.ACCENT),
+        width=40, height=40,
+        bgcolor=Theme.TINT_ACCENT,
+        border_radius=10,
+        border=ft.border.all(1, Theme.BORDER),
+        alignment=ft.alignment.center,
+    )
+    logo = ft.Row(
+        [
+            logo_tile,
+            ft.Column(
+                [
+                    ft.Text("NetTrace", size=16, weight=ft.FontWeight.BOLD,
+                            color=Theme.TEXT),
+                    ft.Text(config.APP_SUBTITLE, size=10,
+                            color=Theme.TEXT_MUTED),
+                ],
+                spacing=0,
+            ),
+        ],
+        spacing=12,
+    )
+    badge = _live_badge(live_dot, live_text)
+    row = ft.Row(
+        [
+            logo,
+            ft.Container(expand=True),
+            top_actions,
+            ft.Container(width=12),
+            badge,
+        ],
+        spacing=0,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    return ft.Container(
+        content=row,
+        padding=ft.padding.symmetric(horizontal=20, vertical=12),
+        bgcolor=Theme.SIDEBAR,
+        border=ft.border.only(bottom=ft.BorderSide(1, Theme.BORDER)),
+    )
+def _live_badge(dot: ft.Container, label: ft.Text) -> ft.Container:
+    """Professional LIVE badge — dark pill with small status dot."""
+    return ft.Container(
+        content=ft.Row([dot, label], spacing=8),
+        padding=ft.padding.symmetric(horizontal=12, vertical=6),
+        bgcolor=Theme.TILE,
+        border_radius=20,
+        border=ft.border.all(1, Theme.BORDER),
+    )
+def _build_sidebar(state: dict) -> ft.Container:
+    """Left navigation sidebar with icon tiles + labels."""
+    items = [
+        ("dashboard", ft.icons.DASHBOARD_ROUNDED, "Dashboard"),
+        ("traffic",   ft.icons.SWAP_VERT_ROUNDED, "Live Traffic"),
+        ("alerts",    ft.icons.NOTIFICATIONS_ACTIVE_ROUNDED, "Alerts"),
+        ("baseline",  ft.icons.INSIGHTS_ROUNDED, "Baseline"),
+        ("reports",   ft.icons.DESCRIPTION_ROUNDED, "Reports"),
+    ]
+    # Small brand label at top
+    brand = ft.Container(
+        content=ft.Text("NAVIGATION", size=9, weight=ft.FontWeight.BOLD,
+                        color=Theme.TEXT_DIM),
+        padding=ft.padding.only(left=12, top=6, bottom=10),
+    )
+    controls = [brand]
+    for key, icon, label in items:
+        controls.append(_sidebar_item(key, icon, label, state))
+        controls.append(ft.Container(height=4))
+    return ft.Container(
+        content=ft.Column(controls, spacing=0),
+        width=230,
+        bgcolor=Theme.SIDEBAR,
+        padding=ft.padding.symmetric(horizontal=12, vertical=20),
+        border=ft.border.only(right=ft.BorderSide(1, Theme.BORDER)),
+    )
+def _sidebar_item(key: str, icon: str, label: str, state: dict) -> ft.Container:
+    """A single sidebar navigation item with professional icon tile."""
+    is_active = state.get("view") == key
+    # Icon tile — muted background, subtle border, accent when active
+    icon_tile = ft.Container(
+        content=ft.Icon(
+            icon, size=16,
+            color=Theme.ACCENT if is_active else Theme.TEXT_MUTED,
+        ),
+        width=32, height=32,
+        bgcolor=Theme.TINT_ACCENT if is_active else Theme.TILE,
+        border_radius=8,
+        border=ft.border.all(1, Theme.BORDER),
+        alignment=ft.alignment.center,
+    )
+    label_text = ft.Text(
+        label, size=12,
+        color=Theme.TEXT if is_active else Theme.TEXT_MUTED,
+        weight=ft.FontWeight.W_600 if is_active else ft.FontWeight.W_500,
+    )
+    container = ft.Container(
+        content=ft.Row([icon_tile, label_text], spacing=12),
+        padding=ft.padding.symmetric(horizontal=8, vertical=6),
+        border_radius=10,
+        bgcolor=Theme.CARD if is_active else None,
+        border=ft.border.all(
+            1, Theme.BORDER if is_active else "#00000000"
+        ),
+        ink=True,
+    )
+    container.data = {"key": key, "tile": icon_tile, "label": label_text}
+    def on_click(e: ft.ControlEvent) -> None:
+        try:
+            state["handlers"]["render_view"](key)
+        except Exception:
+            pass
+    def on_hover(e: ft.ControlEvent) -> None:
+        if state.get("view") != key:
+            try:
+                e.control.bgcolor = (Theme.CARD_HOVER
+                                     if e.data == "true" else None)
+                e.control.update()
+            except Exception:
+                pass
+    container.on_click = on_click
+    container.on_hover = on_hover
+    return container
+def _highlight_sidebar(sidebar: ft.Container, active_key: str) -> None:
+    """Update highlight colours on all sidebar items."""
+    try:
+        for ctrl in sidebar.content.controls:
+            if not isinstance(ctrl, ft.Container) or not ctrl.data:
+                continue
+            key = ctrl.data.get("key")
+            if key is None:
+                continue
+            is_active = (key == active_key)
+            ctrl.bgcolor = Theme.CARD if is_active else None
+            ctrl.border = ft.border.all(
+                1, Theme.BORDER if is_active else "#00000000"
+            )
+            tile = ctrl.data.get("tile")
+            label = ctrl.data.get("label")
+            if tile is not None:
+                tile.bgcolor = (Theme.TINT_ACCENT if is_active
+                                else Theme.TILE)
+                tile.content.color = (Theme.ACCENT if is_active
+                                      else Theme.TEXT_MUTED)
+            if label is not None:
+                label.color = Theme.TEXT if is_active else Theme.TEXT_MUTED
+                label.weight = (ft.FontWeight.W_600 if is_active
+                                else ft.FontWeight.W_500)
+    except Exception:
+        pass
+def _build_status_bar() -> ft.Container:
+    """Footer status bar."""
+    return ft.Container(
+        content=ft.Row(
+            [
+                ft.Text(f"v{config.APP_VERSION}", size=11,
+                        color=Theme.TEXT_DIM),
+                ft.Container(expand=True),
+                ft.Text("Educational use only", size=11,
+                        color=Theme.TEXT_DIM),
+            ],
+        ),
+        padding=ft.padding.symmetric(horizontal=24, vertical=8),
+        bgcolor=Theme.SIDEBAR,
+        border=ft.border.only(top=ft.BorderSide(1, Theme.BORDER)),
+    )
+# ═══════════════════════════════════════════════════════════════
+#  VIEWS
+# ═══════════════════════════════════════════════════════════════
+def _build_view(view: str, stats_row, packets_list, alerts_list,
+                traffic_chart, protocol_chart,
+                make_pdf=None, make_html=None, open_reports=None):
+    """Return the content widget for a given view key."""
+    if view == "dashboard":
+        return ft.Column(
+            [
+                _page_title("Dashboard",
+                            "Real-time overview of network traffic"),
+                ft.Container(height=16),
+                stats_row,
+                ft.Container(height=16),
+                ft.Row(
+                    [
+                        _panel("Traffic Rate (last 60s)",
+                               _wrap_chart(traffic_chart), flex=3),
+                        ft.Container(width=16),
+                        _panel("Protocol Distribution",
+                               _wrap_chart(protocol_chart), flex=2),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                ),
+                ft.Container(height=16),
+                ft.Row(
+                    [
+                        _panel("Recent Traffic",
+                               _wrap_list(packets_list), flex=1),
+                        ft.Container(width=16),
+                        _panel("Security Alerts",
+                               _wrap_list(alerts_list), flex=1),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                ),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            spacing=0,
+        )
+    if view == "traffic":
+        return ft.Column(
+            [
+                _page_title("Live Traffic",
+                            "Full stream of captured packets"),
+                ft.Container(height=16),
+                _panel("All Packets", _wrap_list(packets_list, height=620)),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+        )
+    if view == "alerts":
+        return ft.Column(
+            [
+                _page_title("Security Alerts",
+                            "Unknown & suspicious packet notifications"),
+                ft.Container(height=16),
+                _panel("Alert Feed", _wrap_list(alerts_list, height=620)),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+        )
+    if view == "baseline":
+        baseline_table = _build_baseline_table()
+        return ft.Column(
+            [
+                _page_title("Learned Baseline",
+                            "Per-port statistical profiles"),
+                ft.Container(height=16),
+                _panel("Baseline Entries", baseline_table, height=620),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+        )
+    if view == "reports":
+        # Reports view — intentionally simple and compatibility-friendly.
+        # The three cards are real clickable controls.
+        report_cards = ft.Row(
+            controls=[
+                _report_card(
+                    "PDF Report",
+                    "Professional A4 layout",
+                    ft.icons.PICTURE_AS_PDF_ROUNDED,
+                    Theme.DANGER,
+                    Theme.TINT_DANGER,
+                    make_pdf,
+                ),
+                _report_card(
+                    "HTML Report",
+                    "Shareable web version",
+                    ft.icons.LANGUAGE_ROUNDED,
+                    Theme.INFO,
+                    Theme.TINT_INFO,
+                    make_html,
+                ),
+                _report_card(
+                    "Open Folder",
+                    "Browse saved reports",
+                    ft.icons.FOLDER_OPEN_ROUNDED,
+                    Theme.WARNING,
+                    Theme.TINT_WARNING,
+                    open_reports,
+                ),
+            ],
+            spacing=16,
+        )
+        return ft.Column(
+            controls=[
+                _page_title("Reports", "Generate and export security reports"),
+                ft.Container(height=16),
+                report_cards,
+            ],
+            spacing=0,
+            scroll=ft.ScrollMode.AUTO,
+        )
+    return ft.Text("Unknown view", color=Theme.TEXT)
+def _page_title(title: str, subtitle: str) -> ft.Column:
+    """Page title block."""
+    return ft.Column(
+        [
+            ft.Text(title, size=22, weight=ft.FontWeight.BOLD,
+                    color=Theme.TEXT),
+            ft.Text(subtitle, size=12, color=Theme.TEXT_MUTED),
+        ],
+        spacing=2,
+    )
+def _panel(title: str, body: ft.Control, height: int | None = None,
+           flex: int = 0) -> ft.Container:
+    """Card-styled panel with title."""
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Text(title, size=12, weight=ft.FontWeight.W_600,
+                        color=Theme.TEXT_MUTED),
+                ft.Container(height=10),
+                body,
+            ],
+            spacing=0,
+        ),
+        bgcolor=Theme.CARD,
+        border_radius=14,
+        padding=18,
+        border=ft.border.all(1, Theme.BORDER),
+        height=height,
+        expand=(flex > 0),
+    )
+# ═══════════════════════════════════════════════════════════════
+#  STAT CARDS  —  Dark glass tiles with colored accent icon
+# ═══════════════════════════════════════════════════════════════
+def _stat_card(label: str, value: str, icon: str,
+               accent: str, tint: str) -> ft.Container:
+    """Professional stat card — dark surface, colored icon tile, thin
+    accent line on the left edge."""
+    value_text = ft.Text(value, size=28, weight=ft.FontWeight.BOLD,
+                         color=Theme.TEXT)
+    icon_tile = ft.Container(
+        content=ft.Icon(icon, size=16, color=accent),
+        width=36, height=36,
+        bgcolor=tint,
+        border_radius=10,
+        border=ft.border.all(1, Theme.BORDER),
+        alignment=ft.alignment.center,
+    )
+    card = ft.Container(
+        content=ft.Row(
+            [
+                # Left accent bar
+                ft.Container(width=3, bgcolor=accent, border_radius=2,
+                             height=52),
+                ft.Container(width=12),
+                ft.Column(
+                    [
+                        ft.Text(label, size=11, color=Theme.TEXT_MUTED,
+                                weight=ft.FontWeight.W_500),
+                        ft.Container(height=4),
+                        value_text,
+                    ],
+                    spacing=0, expand=True,
+                ),
+                icon_tile,
+            ],
+            spacing=0,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=16,
+        border_radius=14,
+        bgcolor=Theme.CARD,
+        border=ft.border.all(1, Theme.BORDER),
+        expand=True,
+        data=value_text,
+        animate_scale=ft.animation.Animation(180, ft.AnimationCurve.EASE_OUT),
+        animate=ft.animation.Animation(200, ft.AnimationCurve.EASE_OUT),
+    )
+    def on_hover(e: ft.ControlEvent) -> None:
+        try:
+            if e.data == "true":
+                card.scale = 1.02
+                card.bgcolor = Theme.CARD_HOVER
+                card.shadow = ft.BoxShadow(
+                    blur_radius=20, spread_radius=0,
+                    color="#00000055",
+                    offset=ft.Offset(0, 4),
+                )
+            else:
+                card.scale = 1.0
+                card.bgcolor = Theme.CARD
+                card.shadow = None
+            card.update()
+        except Exception:
+            pass
+    card.on_hover = on_hover
+    return card
+def _set_card(card: ft.Container, value: str) -> None:
+    """Update a stat card's numeric value."""
+    try:
+        card.data.value = value
+    except Exception:
+        pass
+def _update_stats(c1, c2, c3, c4) -> None:
+    """Refresh all stat cards from DB."""
+    try:
+        total, unknown, suspicious = db.get_packet_stats()
+        known = total - unknown - suspicious
+        _set_card(c1, str(total))
+        _set_card(c2, str(known))
+        _set_card(c3, str(unknown))
+        _set_card(c4, str(suspicious))
+    except Exception:
+        pass
+# ═══════════════════════════════════════════════════════════════
+#  CHARTS
+# ═══════════════════════════════════════════════════════════════
+def _build_traffic_chart() -> ft.Column:
+    """Build a bar-chart widget for traffic rate."""
+    return ft.Column(spacing=8)
+def _update_charts(traffic_chart: ft.Column,
+                   protocol_chart: ft.Column) -> None:
+    """Refresh both charts from DB."""
+    try:
+        _update_traffic_chart(traffic_chart)
+        _update_protocol_chart(protocol_chart)
+    except Exception:
+        pass
+def _update_traffic_chart(chart: ft.Column) -> None:
+    """Simple traffic bar chart from recent packets."""
+    packets = db.get_recent_packets(60)
+    if not packets:
+        chart.controls = [ft.Text("Waiting for data…", size=12,
+                                  color=Theme.TEXT_MUTED)]
+        return
+    groups = {"KNOWN": 0, "UNKNOWN": 0, "SUSPICIOUS": 0}
+    for p in packets:
+        groups[p.classification] = groups.get(p.classification, 0) + 1
+    total = max(1, sum(groups.values()))
+    new_controls = []
+    for label, count in groups.items():
+        pct = count / total
+        color = (Theme.SUCCESS if label == "KNOWN"
+                 else Theme.WARNING if label == "UNKNOWN"
+                 else Theme.DANGER)
+        bar = ft.Container(
+            bgcolor=color, border_radius=4,
+            width=max(4, int(pct * 260)), height=6,
+            animate=ft.animation.Animation(400, ft.AnimationCurve.EASE_OUT),
+        )
+        new_controls.append(
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(label, size=11, color=Theme.TEXT_MUTED),
+                            ft.Container(expand=True),
+                            ft.Text(f"{count}", size=12,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=Theme.TEXT),
+                        ],
+                    ),
+                    ft.Container(
+                        content=bar,
+                        bgcolor=Theme.BG_ALT,
+                        border_radius=4,
+                        height=6,
+                    ),
+                ],
+                spacing=4,
+            )
+        )
+    new_controls.append(ft.Container(height=4))
+    new_controls.append(
+        ft.Text(f"{total} packets in view", size=10,
+                color=Theme.TEXT_DIM)
+    )
+    chart.controls = new_controls
+def _build_protocol_bars() -> ft.Column:
+    """Build protocol distribution widget."""
+    return ft.Column(spacing=10)
+def _update_protocol_chart(chart: ft.Column) -> None:
+    """Refresh protocol distribution bars."""
+    stats = db.get_protocol_stats()
+    if not stats:
+        chart.controls = [ft.Text("No protocol data", size=12,
+                                  color=Theme.TEXT_MUTED)]
+        return
+    # Muted but distinct palette
+    palette = [Theme.ACCENT, Theme.PURPLE, Theme.WARNING,
+               Theme.SUCCESS, Theme.INFO, Theme.DANGER]
+    total = max(1, sum(c for _, c in stats))
+    controls = []
+    for i, (proto, count) in enumerate(stats[:6]):
+        pct = count / total
+        color = palette[i % len(palette)]
+        controls.append(
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Container(width=8, height=8,
+                                         bgcolor=color, border_radius=2),
+                            ft.Text(proto, size=11, color=Theme.TEXT),
+                            ft.Container(expand=True),
+                            ft.Text(f"{int(pct * 100)}%", size=11,
+                                    color=Theme.TEXT_MUTED),
+                        ],
+                    ),
+                    ft.Container(
+                        content=ft.Container(
+                            bgcolor=color, border_radius=4,
+                            width=max(4, int(pct * 200)), height=6,
+                            animate=ft.animation.Animation(
+                                400, ft.AnimationCurve.EASE_OUT),
+                        ),
+                        bgcolor=Theme.BG_ALT, border_radius=4, height=6,
+                    ),
+                ],
+                spacing=4,
+            )
+        )
+    chart.controls = controls
+# ═══════════════════════════════════════════════════════════════
+#  LISTS
+# ═══════════════════════════════════════════════════════════════
+def _wrap_list(lv: ft.ListView, height: int = 340) -> ft.Container:
+    """Wrap a ListView in a fixed-height container."""
+    return ft.Container(content=lv, height=height)
+def _wrap_chart(chart: ft.Column) -> ft.Container:
+    """Wrap a chart in a fixed-height container."""
+    return ft.Container(content=chart, height=160)
+def _load_recent(state: dict, lock: threading.Lock) -> None:
+    """Seed UI state from DB on startup."""
+    try:
+        with lock:
+            if not state["packets"]:
+                state["packets"] = db.get_recent_packets(config.UI_MAX_ROWS)
+            if not state["alerts"]:
+                for a in db.get_recent_alerts(config.UI_MAX_ROWS):
+                    state["alerts"].append({
+                        "time": a.timestamp, "severity": a.severity,
+                        "msg": a.message,
+                    })
+    except Exception:
+        pass
+def _render_lists(packets_list: ft.ListView, alerts_list: ft.ListView,
+                  state: dict, lock: threading.Lock) -> None:
+    """Re-render the packet & alert lists from state."""
+    with lock:
+        packets = list(state["packets"])
+        alerts = list(state["alerts"])
+    new_packets = [_packet_row(p) for p in packets]
+    if len(packets_list.controls) != len(new_packets):
+        packets_list.controls = new_packets
+    new_alerts = [_alert_row(a) for a in alerts]
+    if len(alerts_list.controls) != len(new_alerts):
+        alerts_list.controls = new_alerts
+def _packet_row(p) -> ft.Container:
+    """Build a single packet row container with professional icon tile."""
+    if p.classification == config.CLASS_SUSPICIOUS:
+        accent, tint = Theme.DANGER, Theme.TINT_DANGER
+    elif p.classification == config.CLASS_UNKNOWN:
+        accent, tint = Theme.WARNING, Theme.TINT_WARNING
+    else:
+        accent, tint = Theme.SUCCESS, Theme.TINT_SUCCESS
+    ts = p.timestamp.split(" ")[-1] if " " in p.timestamp else p.timestamp
+    icon_tile = ft.Container(
+        content=ft.Icon(ft.icons.SWAP_VERT_ROUNDED, size=14, color=accent),
+        width=30, height=30,
+        bgcolor=tint,
+        border_radius=8,
+        border=ft.border.all(1, Theme.BORDER),
+        alignment=ft.alignment.center,
+    )
+    return ft.Container(
+        content=ft.Row(
+            [
+                icon_tile,
+                ft.Column(
+                    [
+                        ft.Text(f"{p.src_ip}:{p.src_port} → "
+                                f"{p.dst_ip}:{p.dst_port}",
+                                size=12, color=Theme.TEXT,
+                                weight=ft.FontWeight.W_500),
+                        ft.Text(f"{ts} · {p.protocol} · "
+                                f"{p.length}B · {p.reason}",
+                                size=10, color=Theme.TEXT_MUTED),
+                    ],
+                    spacing=1, expand=True,
+                ),
+                ft.Container(
+                    content=ft.Text(p.classification, size=9,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=accent),
+                    bgcolor=tint,
+                    padding=ft.padding.symmetric(horizontal=8, vertical=3),
+                    border_radius=8,
+                    border=ft.border.all(1, Theme.BORDER),
+                ),
+            ],
+            spacing=10,
+        ),
+        padding=ft.padding.symmetric(horizontal=10, vertical=8),
+        bgcolor=Theme.BG_ALT,
+        border_radius=10,
+        border=ft.border.all(1, Theme.BORDER_SOFT),
+    )
+def _alert_row(a: dict) -> ft.Container:
+    """Build a single alert row container with professional icon tile."""
+    if a["severity"] in ("HIGH", "CRITICAL"):
+        accent, tint = Theme.DANGER, Theme.TINT_DANGER
+    else:
+        accent, tint = Theme.WARNING, Theme.TINT_WARNING
+    ts = a["time"].split(" ")[-1] if " " in a["time"] else a["time"]
+    icon_tile = ft.Container(
+        content=ft.Icon(ft.icons.WARNING_AMBER_ROUNDED, size=14,
+                        color=accent),
+        width=30, height=30,
+        bgcolor=tint,
+        border_radius=8,
+        border=ft.border.all(1, Theme.BORDER),
+        alignment=ft.alignment.center,
+    )
+    return ft.Container(
+        content=ft.Row(
+            [
+                icon_tile,
+                ft.Column(
+                    [
+                        ft.Text(f"[{a['severity']}]", size=10,
+                                color=accent, weight=ft.FontWeight.BOLD),
+                        ft.Text(a["msg"], size=11, color=Theme.TEXT),
+                        ft.Text(ts, size=9, color=Theme.TEXT_DIM),
+                    ],
+                    spacing=1, expand=True,
+                ),
+            ],
+            spacing=10,
+        ),
+        padding=ft.padding.symmetric(horizontal=10, vertical=8),
+        bgcolor=Theme.BG_ALT,
+        border_radius=10,
+        border=ft.border.all(1, Theme.BORDER_SOFT),
+    )
+# ═══════════════════════════════════════════════════════════════
+#  BASELINE TABLE
+# ═══════════════════════════════════════════════════════════════
+def _build_baseline_table() -> ft.Column:
+    """Build baseline table view."""
+    entries = db.get_all_baseline()
+    if not entries:
+        return ft.Column([ft.Text("No baseline entries yet.",
+                                  size=12, color=Theme.TEXT_MUTED)])
+    header = ft.Row(
+        [
+            _cell("Port", bold=True, width=80),
+            _cell("Proto", bold=True, width=80),
+            _cell("Hits", bold=True, width=80),
+            _cell("First Seen", bold=True, width=180),
+            _cell("Last Seen", bold=True, width=180),
+            _cell("Mean Bytes", bold=True, width=120),
+        ],
+        spacing=0,
+    )
+    rows = [header,
+            ft.Container(height=1, bgcolor=Theme.BORDER)]
+    for e in entries[:80]:
+        rows.append(
+            ft.Row(
+                [
+                    _cell(str(e.dst_port), width=80),
+                    _cell(e.protocol, width=80),
+                    _cell(str(e.hit_count), width=80),
+                    _cell(e.first_seen, width=180),
+                    _cell(e.last_seen, width=180),
+                    _cell(f"{e.mean_bytes():.0f}", width=120),
+                ],
+                spacing=0,
+            )
+        )
+        rows.append(ft.Container(height=1, bgcolor=Theme.BORDER_SOFT))
+    return ft.Column(rows, spacing=0, scroll=ft.ScrollMode.AUTO)
+def _cell(text: str, bold: bool = False, width: int = 100) -> ft.Container:
+    """A table cell."""
+    return ft.Container(
+        content=ft.Text(text, size=11,
+                        color=Theme.TEXT if bold else Theme.TEXT_MUTED,
+                        weight=(ft.FontWeight.BOLD if bold
+                                else ft.FontWeight.NORMAL)),
+        width=width,
+        padding=ft.padding.symmetric(horizontal=6, vertical=8),
+    )
+# ═══════════════════════════════════════════════════════════════
+#  BUTTONS & NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════════
+def _action_button(label: str, icon: str, color: str,
+                   handler) -> ft.Container:
+    """Professional dark pill button with colored icon and left accent."""
+    icon_widget = ft.Icon(icon, size=14, color=color)
+    container = ft.Container(
+        content=ft.Row(
+            [
+                icon_widget,
+                ft.Text(label, size=11, color=Theme.TEXT,
+                        weight=ft.FontWeight.W_500),
+            ],
+            spacing=6, tight=True,
+        ),
+        padding=ft.padding.symmetric(horizontal=12, vertical=8),
+        bgcolor=Theme.TILE,
+        border_radius=9,
+        border=ft.border.all(1, Theme.BORDER),
+        ink=True,
+        animate_scale=ft.animation.Animation(140, ft.AnimationCurve.EASE_OUT),
+        on_click=lambda e: handler(),
+    )
+    def on_hover(e: ft.ControlEvent) -> None:
+        try:
+            if e.data == "true":
+                container.scale = 1.04
+                container.bgcolor = Theme.TILE_HOVER
+                container.border = ft.border.all(1, color)
+                container.shadow = ft.BoxShadow(
+                    blur_radius=10, color=f"{color}33",
+                )
+            else:
+                container.scale = 1.0
+                container.bgcolor = Theme.TILE
+                container.border = ft.border.all(1, Theme.BORDER)
+                container.shadow = None
+            container.update()
+        except Exception:
+            pass
+    container.on_hover = on_hover
+    return container
+def _toast(page: ft.Page, message: str, color: str, icon: str) -> None:
+    """Show a floating toast notification."""
+    try:
+        snack = ft.SnackBar(
+            content=ft.Row(
+                [ft.Icon(icon, color=Theme.TEXT, size=16),
+                 ft.Text(message, color=Theme.TEXT, size=12)],
+                spacing=10,
+            ),
+            bgcolor=Theme.CARD,
+            duration=2500,
+            behavior=ft.SnackBarBehavior.FLOATING,
+            margin=ft.margin.only(bottom=20, right=20, left=20),
+            shape=ft.RoundedRectangleBorder(radius=10),
+        )
+        page.overlay.append(snack)
+        snack.open = True
+        page.update()
+    except Exception:
+        pass
+def _report_card(title: str, subtitle: str, icon: str,
+                 accent: str, tint: str, handler=None) -> ft.Container:
+    """Clickable report card with broad Flet-version compatibility."""
+    icon_tile = ft.Container(
+        content=ft.Icon(icon, size=24, color=accent),
+        width=52,
+        height=52,
+        bgcolor=tint,
+        border_radius=14,
+        border=ft.border.all(1, Theme.BORDER),
+        alignment=ft.alignment.center,
+    )
+    card = ft.Container(
+        content=ft.Column(
+            controls=[
+                icon_tile,
+                ft.Container(height=14),
+                ft.Text(title, size=14, weight=ft.FontWeight.W_600,
+                        color=Theme.TEXT),
+                ft.Container(height=2),
+                ft.Text(subtitle, size=11, color=Theme.TEXT_MUTED),
+            ],
+            spacing=0,
+        ),
+        padding=20,
+        width=220,
+        height=170,
+        bgcolor=Theme.CARD,
+        border_radius=14,
+        border=ft.border.all(1, Theme.BORDER),
+        ink=True,
+    )
+    # Assign the callback after creation to avoid constructor/event-version issues.
+    if handler is not None:
+        card.on_click = handler
+    def on_hover(e: ft.ControlEvent) -> None:
+        try:
+            if e.data == "true":
+                card.scale = 1.03
+                card.bgcolor = Theme.CARD_HOVER
+                card.border = ft.border.all(1, accent)
+                card.shadow = ft.BoxShadow(
+                    blur_radius=18, color=f"{accent}33",
+                    offset=ft.Offset(0, 4),
+                )
+            else:
+                card.scale = 1.0
+                card.bgcolor = Theme.CARD
+                card.border = ft.border.all(1, Theme.BORDER)
+                card.shadow = None
+            card.update()
+        except Exception:
+            pass
+    card.on_hover = on_hover
+    return card
+def _basename(path: str) -> str:
+    """Return the file name portion of a path."""
+    try:
+        return path.replace("\\", "/").rstrip("/").split("/")[-1]
+    except Exception:
+        return path
+# ═══════════════════════════════════════════════════════════════
+#  ENTRYPOINT
+# ═══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    ft.app(target=main)
+tests/test_baseline.py
+"""
+NetTrace — Baseline Unit Tests
+==============================
+Verifies the classification cascade and statistical helpers.
+"""
+from __future__ import annotations
+import os
+import tempfile
+import unittest
+from pathlib import Path
+# Redirect DB to a temp file BEFORE importing config-dependent modules.
+import config  # noqa: E402
+_tmp_dir = tempfile.mkdtemp(prefix="nettrace_tests_")
+config.DB_PATH = Path(_tmp_dir) / "test_nettrace.db"
+import database as db  # noqa: E402
+from baseline import classify_packet  # noqa: E402
+from models import BaselineEntry  # noqa: E402
+class TestBaseline(unittest.TestCase):
+    """Unit tests for baseline learning & anomaly detection."""
+    def setUp(self) -> None:
+        """Wipe the test DB before each test."""
+        db.init_db()
+        db.clear_all()
+    def test_risky_port_is_suspicious(self) -> None:
+        """Packets to risky ports must be SUSPICIOUS immediately."""
+        cls, reason = classify_packet(23, "TCP", 60, "10.0.0.1")
+        self.assertEqual(cls, config.CLASS_SUSPICIOUS)
+        self.assertIn("Risky port", reason)
+    def test_common_port_is_known_first_time(self) -> None:
+        """First packet to a common port should be KNOWN."""
+        cls, _ = classify_packet(80, "TCP", 500, "10.0.0.1")
+        self.assertEqual(cls, config.CLASS_KNOWN)
+    def test_unknown_port_learning_then_known(self) -> None:
+        """New port stays UNKNOWN during learning, then becomes KNOWN."""
+        port = 50505
+        results = []
+        for _ in range(config.LEARNING_THRESHOLD + 1):
+            cls, _ = classify_packet(port, "TCP", 400, "10.0.0.2")
+            results.append(cls)
+        self.assertEqual(results[0], config.CLASS_UNKNOWN)
+        self.assertEqual(results[-1], config.CLASS_KNOWN)
+    def test_byte_size_anomaly(self) -> None:
+        """A huge packet after learning should trigger byte-size anomaly."""
+        port = 50506
+        for _ in range(config.LEARNING_THRESHOLD + 2):
+            classify_packet(port, "UDP", 300, "10.0.0.3")
+        cls, reason = classify_packet(port, "UDP", 50000, "10.0.0.3")
+        self.assertEqual(cls, config.CLASS_UNKNOWN)
+        self.assertIn("anomaly", reason.lower())
+    def test_baseline_entry_persisted(self) -> None:
+        """Baseline rows must be retrievable after classification."""
+        classify_packet(50507, "TCP", 100, "10.0.0.4")
+        entry = db.get_baseline_entry(50507, "TCP")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.hit_count, 1)
+        self.assertEqual(entry.byte_history, [100])
+    def test_entry_mean_and_stddev(self) -> None:
+        """BaselineEntry mean/stddev helpers must be numerically correct."""
+        entry = BaselineEntry(
+            dst_port=1, protocol="TCP",
+            byte_history=[10, 20, 30],
+        )
+        self.assertAlmostEqual(entry.mean_bytes(), 20.0, places=4)
+        self.assertGreater(entry.stddev_bytes(), 0.0)
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+requirements.txt
+flet==0.24.1
+scapy==2.5.0
+reportlab==4.2.5
+README.md
+# 🛡️ NetTrace — Unknown Network Traffic Detector
+A production-ready Network Security Monitoring (NSM) system that captures
+live traffic metadata, learns a statistical baseline, detects unknown /
+suspicious traffic, and produces professional HTML + PDF security reports.
+> **Educational use only.** Capture only networks you own or are authorised
+> to monitor.
+---
+## 1. Objective
+- Capture **metadata only** (no payloads) via Scapy.
+- Learn per-port / per-protocol baselines (mean + stddev + hit count).
+- Flag **UNKNOWN** (new / still learning) and **SUSPICIOUS** (risky port,
+  spike, statistical outlier) traffic.
+- Persist everything in SQLite.
+- Show a live dashboard in **Flet**.
+- Export **HTML** and **PDF** reports.
+---
+## 2. Technologies & Packages
+| Package     | Purpose                                     |
+|-------------|---------------------------------------------|
+| Python 3.10+| Language                                    |
+| flet        | Cross-platform desktop GUI (Flutter-based)  |
+| scapy       | Packet capture (TCP/UDP/ICMP metadata)      |
+| reportlab   | PDF generation                              |
+| sqlite3     | Standard-library embedded DB                |
+---
+## 3. Folder Structure
+```
+NetTrace/
+├── main.py
+├── scanner.py
+├── analyzer.py
+├── baseline.py
+├── reputation.py
+├── database.py
+├── models.py
+├── report_html.py
+├── report_pdf.py
+├── utils.py
+├── config.py
+├── requirements.txt
+├── README.md
+├── data/            ← auto-created, holds nettrace.db
+├── reports/
+│   ├── html/
+│   └── pdf/
+└── tests/
+    └── test_baseline.py
+```
+---
+## 4. Setup (Windows / Linux / macOS)
+```bash
+# 1. Clone / create the folder
+mkdir NetTrace && cd NetTrace
+# 2. Create & activate a virtual environment
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+# 3. Install dependencies
+python.exe -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install --upgrade flet
+```
+### Windows — Npcap
+Scapy needs a packet capture driver on Windows:
+1. Download **Npcap**: https://npcap.com/#download
+2. Install with **"WinPcap API-compatible Mode"** enabled.
+3. Reboot if prompted.
+### Linux
+```bash
+sudo apt install libpcap-dev python3-tk
+# Run as root, or:
+sudo setcap cap_net_raw,cap_net_admin=eip $(readlink -f $(which python3))
+```
+### macOS
+```bash
+brew install libpcap
+```
+---
+## 5. Run
+```bash
+# Windows (as Administrator) / Linux / macOS (sudo)
+python main.py
+```
+The Flet window opens. Click **▶ Start Monitoring**.
+---
+## 6. Dashboard Buttons
+| Button               | Action                                             |
+|----------------------|----------------------------------------------------|
+| ▶ Start Monitoring   | Launches the Scapy sniffer thread                  |
+| ⏹ Stop               | Stops the sniffer                                  |
+| 🔄 Refresh           | Reloads DB data into the UI                        |
+| 📄 Generate PDF      | Builds & opens a PDF report                        |
+| 🌐 Generate HTML     | Builds & opens an HTML report                      |
+| 📂 Open Reports      | Opens `reports/` in the OS file manager            |
+| 🗑 Reset DB          | Deletes all packets, alerts and baseline rows      |
+---
+## 7. Testing Walkthrough
+1. Start the app, click **▶ Start Monitoring**.
+2. Open a browser → normal HTTPS (443) traffic is captured as `KNOWN`.
+3. Use `nmap -p 23 <some-host>` → risky-port hits appear as `SUSPICIOUS`.
+4. Use `ping <host>` → ICMP rows appear (port 0).
+5. Wait 30–60s, then click **📄 Generate PDF** and **🌐 Generate HTML**.
+6. Verify outputs in `reports/pdf/` and `reports/html/`.
+---
+## 8. Baseline Behaviour Example
+| Step | Observation                          | Result                     |
+|------|--------------------------------------|----------------------------|
+| 1    | First packet to port 9999            | UNKNOWN (First-seen)       |
+| 2    | 2nd–4th packets to 9999              | UNKNOWN (Learning 2/5 …)   |
+| 3    | 5th packet, normal size              | KNOWN (Baseline established)|
+| 4    | 6th packet, 10× normal size          | UNKNOWN (Byte-size anomaly) |
+| 5    | 50 packets in 1 minute               | SUSPICIOUS (Traffic spike) |
+| 6    | Any packet to port 23 / 445 / 3389   | SUSPICIOUS (Risky port)    |
+---
+## 9. Report Explanation
+Both HTML and PDF reports contain:
+1. Header + timestamp
+2. Risk banner (LOW / MEDIUM / HIGH) with numeric score
+3. Summary cards — Total / Known / Unknown / Suspicious
+4. Protocol Statistics table
+5. Top Unknown / Suspicious Sources
+6. Security Alerts table
+7. Recent Traffic table
+8. Learned Baseline table
+9. Recommendations list
+Risk score weights: `SUSPICIOUS×10 + UNKNOWN×3 + HIGH_alerts×8 + MEDIUM_alerts×3`.
+---
+## 10. Troubleshooting
+| Symptom                                | Fix                                                |
+|----------------------------------------|----------------------------------------------------|
+| `ModuleNotFoundError: scapy`           | `pip install -r requirements.txt`                  |
+| `PermissionError` on capture           | Run as Administrator / sudo, or setcap on Linux    |
+| No packets appear                      | Confirm network activity; try `ping 8.8.8.8`       |
+| Empty PDF/HTML tables                  | Capture for a minute before generating a report    |
+| Flet window blank                      | `pip install --upgrade flet`                       |
+| Scapy warns about missing Npcap        | Install Npcap with WinPcap compatibility           |
+---
+## 11. Security & Legal Notice
+NetTrace captures **network metadata** on the machine where it runs.
+You must only use it on networks you own or have **explicit written
+permission** to monitor. Unauthorised packet capture is illegal in most
+jurisdictions. The authors accept no liability.
+---
+## 12. Future Improvements
+- GeoIP enrichment
+- ML-based anomaly detection (Isolation Forest / autoencoder)
+- PCAP export
+- Multi-user web dashboard (FastAPI + React)
+- Real-time threat-intel feeds
+- Email / Slack alerting
+---
+## 13. Quick Start TL;DR
+```bash
+mkdir NetTrace && cd NetTrace
+python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+run_checklist.txt
+# 1. From inside NetTrace/
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+# 2. Install deps
+pip install -r requirements.txt
+# 3. Sanity check
+python config.py            # prints paths + "Configuration OK ✅"
+# 4. Run tests
+python -m unittest discover -s tests -v
+# 5. Launch dashboard (needs admin/root for capture)
+sudo python main.py         # Linux/macOS
+# or Windows: Run PowerShell as Administrator → python main.py
+AFTER PROJECT SETUP OUTPUT
